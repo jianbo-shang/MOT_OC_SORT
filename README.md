@@ -2,8 +2,6 @@
 
 这是对原“YOLOv8 + Qt 智能交通监控”项目的可运行复现与二次开发版本。新入口 `mot_app.py` 不依赖旧版 PySide6/supervision 接口，使用仓库自带 YOLOv8 权重完成检测，并在 Kalman + Hungarian 基线上接入类别约束的纯运动 OC-SORT。
 
-![交互窗口实测](outputs/ui_smoke_test.png)
-
 ## 已实现功能
 
 - 图片、视频、本地摄像头三类输入；原始画面与跟踪结果并排显示。
@@ -126,18 +124,6 @@ D:\miniconda\envs\PJT_1\python.exe benchmark_trackers.py --input F:\Opencv\openc
 
 > 性能说明：静态图的首帧推理包含模型初始化，不能作为视频稳态 FPS。简历中不要写“实时 30 FPS”等未经完整视频基准验证的数字。
 
-## 简历与面试材料
-
-- 可直接使用的项目描述：[docs/resume_project.md](docs/resume_project.md)
-- 主张与证据边界：[docs/career-claim-ledger.json](docs/career-claim-ledger.json)
-
-推荐项目名称：**面向智能交通的 YOLOv8 与 OC-SORT 实时多目标跟踪系统（开源复现与二次开发）**。
-
 ## 原项目与许可
 
-原 README 演示链接：
-
-- [Bilibili](https://www.bilibili.com/video/BV1yX4y1m7Fe/)
-- [YouTube](https://youtu.be/_77LrsXaYzM)
-
-原项目参考了 `Jai-wei/YOLOv8-PySide6-GUI`、Ultralytics YOLO 与 Qt for Python。仓库沿用 GPL-3.0 许可；公开发布或二次分发时应继续遵守该许可并保留归属说明。
+原项目参考了 `Jai-wei/YOLOv8-PySide6-GUI`、Ultralytics YOLO 与 Qt for Python。仓库沿用 GPL-3.0 许可；
