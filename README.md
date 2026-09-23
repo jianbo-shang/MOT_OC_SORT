@@ -18,8 +18,7 @@
 - 标注图片/MP4 与逐帧跟踪 CSV 导出。
 - 高 DPI Windows 适配、Unicode 路径图片读写、GUI 后台线程推理。
 
-![alt text](../opencv_project/image-1.png)
-
+![alt text](image.png)
 
 ## 一键运行
 
