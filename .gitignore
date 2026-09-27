@@ -10,8 +10,8 @@ pred_result/
 /data
 /weights/person_*.pt
 /weights/person_reid.onnx
-/导学-交通目标跟踪.md
-/面经-交通目标跟踪.md
-/requirements.txt
+导学-交通目标跟踪.md
+面经-交通目标跟踪.md
+requirements.txt
 
 
