@@ -13,6 +13,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,13 @@ import numpy as np
 from mot_core import FrameAnalyzer, FrameResult, ROOT, draw_tracking_overlay, read_image, write_image
 
 
-MODEL_PATH = ROOT / "weights" / "轻量级模型.pt"
+BASE_MODEL_PATH = ROOT / "weights" / "轻量级模型.pt"
+FINETUNED_MODEL_PATH = ROOT / "weights" / "person_mot17_crowdhuman.pt"
+MODEL_PATH = BASE_MODEL_PATH
+REID_MODEL_PATH = ROOT / "weights" / "person_reid.onnx"
+DETECTION_INTERVAL = 1
+BASE_MODEL_LABEL = "多类别轻量模型"
+PERSON_MODEL_LABEL = "人员微调模型"
 SAMPLE_IMAGE = ROOT / "ultralytics" / "assets" / "bus.jpg"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv"}
@@ -42,6 +49,10 @@ def target_frame_interval(source_fps: float, playback_speed: float) -> float:
     if source_fps <= 0 or playback_speed <= 0:
         return 0.0
     return 1.0 / (source_fps * playback_speed)
+
+
+def detection_strategy_label(interval: int) -> str:
+    return "逐帧检测" if interval == 1 else f"每 {interval} 帧检测"
 
 
 @dataclass(frozen=True)
@@ -111,12 +122,19 @@ class MOTWorkbench:
         self.save_output_var = tk.BooleanVar(value=True)
         self.device_var = tk.StringVar(value="auto")
         self.tracker_var = tk.StringVar(value="OC-SORT")
-        self.subtitle_var = tk.StringVar(value="  YOLOv8 · OC-SORT · Hungarian")
+        self.model_choice_var = tk.StringVar(value=BASE_MODEL_LABEL)
+        self.model_paths = {BASE_MODEL_LABEL: BASE_MODEL_PATH}
+        if FINETUNED_MODEL_PATH.is_file():
+            self.model_paths[PERSON_MODEL_LABEL] = FINETUNED_MODEL_PATH
+        tracking_label = "TOPIC-Lite" if REID_MODEL_PATH.is_file() else "OC-SORT"
+        self.subtitle_var = tk.StringVar(value=f"  YOLOv8 · {tracking_label} · Detect/{DETECTION_INTERVAL}")
         self.playback_speed_var = tk.StringVar(value="1.0×")
         self.playback_speed = PLAYBACK_SPEED_OPTIONS[self.playback_speed_var.get()]
         self.source_var = tk.StringVar(value="未选择输入源")
         self.status_var = tk.StringVar(value="请选择输入源，或直接运行内置示例")
         self.model_var = tk.StringVar(value=MODEL_PATH.name)
+        self.strategy_var = tk.StringVar(value=detection_strategy_label(DETECTION_INTERVAL))
+        self.reid_var = tk.StringVar(value="按需启用" if REID_MODEL_PATH.is_file() else "待放入 person_reid.onnx")
         self.target_var = tk.StringVar(value="0")
         self.fps_var = tk.StringVar(value="--")
         self.count_var = tk.StringVar(value="0")
@@ -145,7 +163,26 @@ class MOTWorkbench:
         style.configure("CardName.TLabel", background=self.COLORS["panel2"], foreground=self.COLORS["muted"], font=("Microsoft YaHei UI", 9))
         style.configure("TCheckbutton", background=self.COLORS["panel"], foreground=self.COLORS["text"], font=("Microsoft YaHei UI", 9))
         style.map("TCheckbutton", background=[("active", self.COLORS["panel"])])
-        style.configure("TCombobox", fieldbackground=self.COLORS["panel2"], foreground=self.COLORS["text"])
+        style.configure(
+            "TCombobox", fieldbackground=self.COLORS["panel2"], foreground=self.COLORS["text"],
+            background=self.COLORS["panel2"], arrowcolor=self.COLORS["muted"],
+            bordercolor=self.COLORS["line"], lightcolor=self.COLORS["panel2"],
+            darkcolor=self.COLORS["panel2"],
+        )
+        style.map(
+            "TCombobox", fieldbackground=[("readonly", self.COLORS["panel2"])],
+            foreground=[("readonly", self.COLORS["text"])],
+            background=[("readonly", self.COLORS["panel2"])],
+            selectbackground=[("readonly", self.COLORS["panel2"])],
+            selectforeground=[("readonly", self.COLORS["text"])],
+        )
+        style.configure(
+            "Sidebar.Vertical.TScrollbar", background=self.COLORS["panel2"],
+            troughcolor=self.COLORS["panel"], bordercolor=self.COLORS["panel"],
+            arrowcolor=self.COLORS["muted"], lightcolor=self.COLORS["panel2"],
+            darkcolor=self.COLORS["panel2"], width=10,
+        )
+        style.map("Sidebar.Vertical.TScrollbar", background=[("active", self.COLORS["line"])])
         style.configure("Horizontal.TProgressbar", troughcolor=self.COLORS["panel2"], background=self.COLORS["cyan"], borderwidth=0)
         style.configure("Treeview", background=self.COLORS["panel2"], fieldbackground=self.COLORS["panel2"], foreground=self.COLORS["text"], rowheight=25, borderwidth=0)
         style.configure("Treeview.Heading", background=self.COLORS["panel"], foreground=self.COLORS["muted"], font=("Microsoft YaHei UI", 9, "bold"))
@@ -168,6 +205,12 @@ class MOTWorkbench:
                       font=("Segoe UI", 10)).pack(side="left", pady=(7, 0))
         self.tk.Label(header, textvariable=self.source_var, bg=self.COLORS["panel2"], fg=self.COLORS["text"],
                       font=("Microsoft YaHei UI", 9), padx=14, pady=8).pack(side="right")
+
+        footer = self.tk.Frame(self.root, bg=self.COLORS["panel"], height=42)
+        footer.pack(fill="x", side="bottom")
+        self.tk.Label(footer, textvariable=self.status_var, bg=self.COLORS["panel"], fg=self.COLORS["muted"],
+                      font=("Microsoft YaHei UI", 9)).pack(side="left", padx=22)
+        self.ttk.Progressbar(footer, variable=self.progress_var, maximum=100, length=260).pack(side="right", padx=22, pady=12)
 
         body = self.tk.Frame(self.root, bg=self.COLORS["bg"])
         body.pack(fill="both", expand=True, padx=22, pady=(0, 14))
@@ -215,14 +258,8 @@ class MOTWorkbench:
         sidebar = self.tk.Frame(body, bg=self.COLORS["panel"], width=320)
         self.sidebar_frame = sidebar
         sidebar.grid(row=0, column=1, sticky="nsew")
-        sidebar.grid_propagate(False)
+        sidebar.pack_propagate(False)
         self._build_sidebar(sidebar)
-
-        footer = self.tk.Frame(self.root, bg=self.COLORS["panel"], height=42)
-        footer.pack(fill="x", side="bottom")
-        self.tk.Label(footer, textvariable=self.status_var, bg=self.COLORS["panel"], fg=self.COLORS["muted"],
-                      font=("Microsoft YaHei UI", 9)).pack(side="left", padx=22)
-        self.ttk.Progressbar(footer, variable=self.progress_var, maximum=100, length=260).pack(side="right", padx=22, pady=12)
 
     def _video_panel(self, parent, title: str, column: int):
         panel = self.tk.Frame(parent, bg=self.COLORS["panel"], highlightbackground=self.COLORS["line"], highlightthickness=1)
@@ -241,6 +278,33 @@ class MOTWorkbench:
         source_row.pack(fill="x", padx=16)
         self._button(source_row, "打开文件", self._open_file, self.COLORS["cyan"], 11).pack(side="left", expand=True, fill="x", padx=(0, 5))
         self._button(source_row, "摄像头", self._open_camera, None, 10).pack(side="left", expand=True, fill="x", padx=(5, 0))
+
+        action_row = self.tk.Frame(parent, bg=self.COLORS["panel"])
+        action_row.pack(fill="x", padx=16, pady=(12, 6))
+        self.start_button = self._button(action_row, "开始检测", self._start_or_pause, self.COLORS["green"], 13)
+        self.start_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        self.stop_button = self._button(action_row, "停止", self._stop, self.COLORS["red"], 9)
+        self.stop_button.pack(side="left", expand=True, fill="x", padx=(5, 0))
+        self.tk.Label(parent, text="Space 开始/暂停  ·  Esc 停止", bg=self.COLORS["panel"],
+                      fg=self.COLORS["muted"], font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=18)
+
+        settings_shell = self.tk.Frame(parent, bg=self.COLORS["panel"])
+        settings_shell.pack(fill="both", expand=True, pady=(8, 0))
+        settings_canvas = self.tk.Canvas(settings_shell, bg=self.COLORS["panel"], highlightthickness=0, bd=0)
+        settings_scrollbar = self.ttk.Scrollbar(
+            settings_shell, orient="vertical", command=settings_canvas.yview,
+            style="Sidebar.Vertical.TScrollbar",
+        )
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        settings_scrollbar.pack(side="right", fill="y")
+        settings_canvas.pack(side="left", fill="both", expand=True)
+        settings = self.tk.Frame(settings_canvas, bg=self.COLORS["panel"])
+        settings_window = settings_canvas.create_window((0, 0), window=settings, anchor="nw")
+        settings.bind("<Configure>", lambda _event: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")))
+        settings_canvas.bind("<Configure>", lambda event: settings_canvas.itemconfigure(settings_window, width=event.width))
+        self._sidebar_canvas = settings_canvas
+        self.root.bind_all("<MouseWheel>", self._on_sidebar_mousewheel, add="+")
+        parent = settings
 
         self._separator(parent)
         self._section_title(parent, "检测参数")
@@ -272,6 +336,17 @@ class MOTWorkbench:
         tracker_combo.pack(side="right")
         tracker_combo.bind("<<ComboboxSelected>>", self._on_tracker_changed)
 
+        model_row = self.tk.Frame(parent, bg=self.COLORS["panel"])
+        model_row.pack(fill="x", padx=18, pady=7)
+        self.tk.Label(model_row, text="检测模型", bg=self.COLORS["panel"], fg=self.COLORS["muted"],
+                      font=("Microsoft YaHei UI", 9)).pack(side="left")
+        model_combo = self.ttk.Combobox(
+            model_row, textvariable=self.model_choice_var, values=tuple(self.model_paths),
+            width=17, state="readonly",
+        )
+        model_combo.pack(side="right")
+        model_combo.bind("<<ComboboxSelected>>", self._on_model_changed)
+
         device_row = self.tk.Frame(parent, bg=self.COLORS["panel"])
         device_row.pack(fill="x", padx=18, pady=7)
         self.tk.Label(device_row, text="推理设备", bg=self.COLORS["panel"], fg=self.COLORS["muted"],
@@ -299,18 +374,20 @@ class MOTWorkbench:
         self._separator(parent)
         self._section_title(parent, "运行状态")
         self._info_row(parent, "模型", self.model_var)
+        self._info_row(parent, "检测策略", self.strategy_var)
+        self._info_row(parent, "人员 ReID", self.reid_var)
         self._info_row(parent, "锁定目标", self.selected_var)
 
-        action_row = self.tk.Frame(parent, bg=self.COLORS["panel"])
-        action_row.pack(fill="x", side="bottom", padx=16, pady=16)
-        self.start_button = self._button(action_row, "开始检测", self._start_or_pause, self.COLORS["green"], 13)
-        self.start_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
-        self._button(action_row, "停止", self._stop, self.COLORS["red"], 9).pack(side="left", expand=True, fill="x", padx=(5, 0))
-
-        tips = self.tk.Label(parent, text="快捷键  Space 开始/暂停  ·  Esc 停止\n点击检测框或目标列表可锁定 ID",
+        tips = self.tk.Label(parent, text="点击检测框或目标列表可锁定 ID",
                              bg=self.COLORS["panel"], fg=self.COLORS["muted"], justify="left",
                              font=("Microsoft YaHei UI", 8), wraplength=280)
-        tips.pack(side="bottom", anchor="w", padx=18, pady=(0, 4))
+        tips.pack(anchor="w", padx=18, pady=(8, 12))
+
+    def _on_sidebar_mousewheel(self, event) -> None:
+        canvas = self._sidebar_canvas
+        x, y = canvas.winfo_rootx(), canvas.winfo_rooty()
+        if x <= event.x_root < x + canvas.winfo_width() and y <= event.y_root < y + canvas.winfo_height():
+            canvas.yview_scroll(-int(event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
 
     def _section_title(self, parent, text: str) -> None:
         self.tk.Label(parent, text=text, bg=self.COLORS["panel"], fg=self.COLORS["text"],
@@ -411,6 +488,7 @@ class MOTWorkbench:
         self.progress_var.set(0)
         self.start_button.configure(text="暂停检测", bg=self.COLORS["orange"])
         config = {
+            "model_path": str(self.model_paths[self.model_choice_var.get()]),
             "confidence": float(self.conf_var.get()),
             "nms_iou": float(self.nms_var.get()),
             "track_iou": float(self.track_iou_var.get()),
@@ -420,6 +498,8 @@ class MOTWorkbench:
             "save_output": bool(self.save_output_var.get()),
             "device": self.device_var.get(),
             "tracker_type": "ocsort" if self.tracker_var.get() == "OC-SORT" else "sort",
+            "detection_interval": DETECTION_INTERVAL,
+            "reid_model_path": str(REID_MODEL_PATH) if REID_MODEL_PATH.is_file() else None,
         }
         self.worker = threading.Thread(target=self._worker_loop, args=(self.source, config), daemon=True)
         self.worker.start()
@@ -432,9 +512,17 @@ class MOTWorkbench:
 
     def _on_tracker_changed(self, _event=None) -> None:
         tracker_name = self.tracker_var.get()
-        self.subtitle_var.set(f"  YOLOv8 · {tracker_name} · Hungarian")
+        mode = ("TOPIC-Lite" if REID_MODEL_PATH.is_file() else "OC-SORT") \
+            if tracker_name == "OC-SORT" else tracker_name
+        self.subtitle_var.set(f"  YOLOv8 · {mode} · Detect/{DETECTION_INTERVAL}")
         suffix = "；将在下次开始时生效" if self.running else ""
         self.status_var.set(f"已选择跟踪器 {tracker_name}{suffix}")
+
+    def _on_model_changed(self, _event=None) -> None:
+        path = self.model_paths[self.model_choice_var.get()]
+        self.model_var.set(path.name)
+        suffix = "；将在下次开始时生效" if self.running else ""
+        self.status_var.set(f"已选择检测模型 {self.model_choice_var.get()}{suffix}")
 
     def _stop(self) -> None:
         self.stop_event.set()
@@ -450,12 +538,14 @@ class MOTWorkbench:
         try:
             self.event_queue.put(("status", "正在加载 YOLOv8 模型与跟踪器…"))
             self.analyzer = FrameAnalyzer(
-                MODEL_PATH,
+                config["model_path"],
                 confidence=config["confidence"], nms_iou=config["nms_iou"],
                 track_iou=config["track_iou"], max_age=config["max_age"],
                 line_ratio=config["line_ratio"], traffic_only=config["traffic_only"],
                 device=config["device"],
                 tracker_type=config["tracker_type"],
+                detection_interval=config["detection_interval"],
+                reid_model_path=config["reid_model_path"],
             )
             self.analyzer.reset()
             if config["save_output"]:
@@ -481,13 +571,17 @@ class MOTWorkbench:
                 fps_source = capture.get(cv2.CAP_PROP_FPS) or 25.0
 
             frame_index = 0
-            fps_ema = 0.0
-            self.event_queue.put(("status", "检测运行中：点击跟踪框可锁定目标 ID"))
+            processing_times = deque(maxlen=30)
+            reid_status = "按需 ReID 已启用" if config["reid_model_path"] else "未提供 ReID 权重，使用运动关联"
+            mode = "Kalman-Hungarian" if config["tracker_type"] == "sort" else \
+                "TOPIC-Lite" if config["reid_model_path"] else "OC-SORT"
+            self.event_queue.put(("status", f"{mode} 运行中：{detection_strategy_label(config['detection_interval'])}；{reid_status}"))
             while not self.stop_event.is_set():
                 while self.pause_event.is_set() and not self.stop_event.is_set():
                     time.sleep(0.05)
                 if self.stop_event.is_set():
                     break
+                started = time.perf_counter()
                 if source.kind == "image":
                     if frame_index > 0:
                         break
@@ -497,11 +591,7 @@ class MOTWorkbench:
                     if not ok:
                         break
                 frame_index += 1
-                started = time.perf_counter()
                 result = self.analyzer.process(current, self.selected_id)
-                elapsed = max(time.perf_counter() - started, 1e-6)
-                instant_fps = 1.0 / elapsed
-                fps_ema = instant_fps if fps_ema == 0 else 0.85 * fps_ema + 0.15 * instant_fps
 
                 if output_dir is not None:
                     if source.kind == "image":
@@ -510,6 +600,8 @@ class MOTWorkbench:
                         if writer is None:
                             height, width = result.frame.shape[:2]
                             writer = cv2.VideoWriter(str(output_dir / "result.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps_source, (width, height))
+                            if not writer.isOpened():
+                                raise RuntimeError("无法创建标注视频 result.mp4")
                         writer.write(result.frame)
                     if csv_writer is not None:
                         for track in result.tracks:
@@ -517,8 +609,15 @@ class MOTWorkbench:
                             name = self.analyzer.detector.names[track.class_id]
                             csv_writer.writerow([frame_index, track.track_id, track.class_id, name, f"{track.score:.4f}",
                                                  f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}"])
+                elapsed = max(time.perf_counter() - started, 1e-6)
+                if frame_index == 1 and source.kind != "image":
+                    # The first video inference initializes the backend; keep it out of steady-state FPS.
+                    process_fps = 1.0 / elapsed
+                else:
+                    processing_times.append(elapsed)
+                    process_fps = len(processing_times) / sum(processing_times)
                 progress = 100.0 if source.kind == "image" else (100.0 * frame_index / total_frames if total_frames > 0 else 0.0)
-                packet = FramePacket(current, result, frame_index, progress, fps_ema, str(output_dir) if output_dir else None)
+                packet = FramePacket(current, result, frame_index, progress, process_fps, str(output_dir) if output_dir else None)
                 try:
                     self.frame_queue.put_nowait(packet)
                 except queue.Full:
